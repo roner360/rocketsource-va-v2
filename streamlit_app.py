@@ -155,7 +155,7 @@ def create_scan():
         "marketplace_id": marketplace_id,
         "name": scan_name,  # nome scan
         # ✅ etichetta per custom columns, stesso ordine di mapping.custom_columns
-        "custom_columns": ["product_title"],
+        
     }
 
     attributes = {"mapping": mapping, "options": options}
