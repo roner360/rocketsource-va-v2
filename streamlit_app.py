@@ -81,7 +81,8 @@ st.subheader("Options")
 scan_name = st.text_input("Nome scan (options.name) — obbligatorio", value=f"Scan - {uploaded.name}")
 marketplace_id = st.text_input("Marketplace ID", value="US")
 
-debug_mode = st.checkbox("Debug mode (mostra JSON scans)", value=False)
+debug_mode = bool(st.secrets.get("DEBUG_MODE", False))
+
 
 if not scan_name.strip():
     st.warning("Il nome scan (options.name) è obbligatorio.")
@@ -235,12 +236,30 @@ if st.button("🔎 Find my scan (latest completed)"):
         scans_json = list_completed_scans(page=1)
         st.session_state["last_scans_json"] = scans_json
 
-        scan_id = find_latest_scan_id(scans_json, scan_name)
-        if scan_id:
-            st.session_state["scan_id"] = scan_id
-            st.success(f"Trovato scan completato ✅  • Scan ID: {scan_id}")
-        else:
-            st.warning("Non trovato ancora. Probabile che la scan NON sia completata. Riprova tra poco.")
+scan_id = find_latest_scan_id(scans_json, scan_name)
+
+if scan_id:
+    # recupera anche lo status dallo stesso JSON
+    status = None
+    scans = scans_json.get("data", []) if isinstance(scans_json, dict) else []
+    for s in scans:
+        if isinstance(s, dict) and str(s.get("id")) == str(scan_id):
+            status = s.get("status")
+            break
+
+    st.session_state["scan_id"] = scan_id
+
+    if status:
+        st.info(f"Scan trovata • ID: {scan_id} • Status: {status}")
+        if status.lower() in ["inprogress", "in_progress"]:
+            st.warning("⏳ Scan ancora in elaborazione. Attendere e riprovare.")
+        elif status.lower() in ["success", "completed"]:
+            st.success("✅ Scan completata. Puoi procedere con il download.")
+    else:
+        st.success(f"Trovata scan • ID: {scan_id}")
+else:
+    st.warning("Non trovata ancora. Probabile che la scan NON sia completata. Riprova tra poco.")
+
 
         if debug_mode:
             with st.expander("Debug GET /api/v3/scans JSON"):
