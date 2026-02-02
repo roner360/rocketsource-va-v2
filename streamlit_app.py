@@ -8,8 +8,8 @@ import pandas as pd
 
 BASE_URL = "https://app.rocketsource.io"
 
-st.set_page_config(page_title="RocketSource Minimal", layout="centered")
-st.title("RocketSource • Upload CSV → Download (VA-safe)")
+st.set_page_config(page_title="Product Scanner Minimal", layout="centered")
+st.title("Product Scanner • Upload CSV → Download (VA-safe)")
 
 # API KEY: solo da secrets (non appare mai)
 api_key = st.secrets.get("ROCKETSOURCE_API_KEY", "")
