@@ -89,38 +89,44 @@ def create_scan():
     url = f"{BASE_URL}/api/v3/scans"
     headers = {"Authorization": f"Bearer {api_key}"}
 
+    upload_bytes = file_bytes
+    upload_filename = uploaded.name
+    working_cols = cols.copy()
+
+    # ✅ Se COST fisso = 1 → riscrivi CSV con colonna finta
+    if use_fixed_cost:
+        df_full = pd.read_csv(io.BytesIO(file_bytes), sep=sep)
+        df_full["__fixed_cost"] = 1
+
+        working_cols = list(df_full.columns)
+        upload_bytes = df_full.to_csv(index=False).encode("utf-8")
+        upload_filename = uploaded.name.replace(".csv", "_fixed_cost.csv")
+
     mapping = {
-        "id": cols.index(id_col),  # 0-indexed
+        "id": working_cols.index(id_col),
+        "cost": working_cols.index("__fixed_cost") if use_fixed_cost else cols.index(cost_col),
     }
 
-    # COST: colonna oppure valore fisso
-    if use_fixed_cost:
-        # RocketSource accetta anche valori fissi in mapping? (non sempre documentato).
-        # Se non lo accetta, sotto trovi la variante "riscrivi CSV".
-        mapping["cost"] = "1"
-    else:
-        mapping["cost"] = cols.index(cost_col)  # 0-indexed
-
-    # Optional: stock_quantity / supplier_image
     if stock_qty_col != "(none)":
-        mapping["stock_quantity"] = cols.index(stock_qty_col)
+        mapping["stock_quantity"] = working_cols.index(stock_qty_col)
 
     if supplier_image_col != "(none)":
-        mapping["supplier_image"] = cols.index(supplier_image_col)
+        mapping["supplier_image"] = working_cols.index(supplier_image_col)
 
     options = {
         "marketplace_id": marketplace_id,
-        "name": scan_name,  # ✅ required
+        "name": scan_name,  # obbligatorio
     }
 
     attributes = {"mapping": mapping, "options": options}
 
-    files = {"file": (uploaded.name, file_bytes)}
+    files = {"file": (upload_filename, upload_bytes)}
     data = {"attributes": json.dumps(attributes)}
 
     r = requests.post(url, headers=headers, files=files, data=data, timeout=60)
     r.raise_for_status()
     return r.json() if r.content else {}
+
 
 def extract_scan_id(resp: dict):
     for k in ("scan_id", "scanId", "id"):
