@@ -8,13 +8,16 @@ import pandas as pd
 BASE_URL = "https://app.rocketsource.io"
 
 st.set_page_config(page_title="RocketSource Minimal", layout="centered")
-st.title("RocketSource • Upload CSV (Minimal)")
+st.title("RocketSource • Upload CSV → Download (VA-safe)")
 
 # API KEY: solo da secrets (non appare mai)
 api_key = st.secrets.get("ROCKETSOURCE_API_KEY", "")
 if not api_key:
     st.error("API key mancante. Aggiungi ROCKETSOURCE_API_KEY nei Secrets di Streamlit.")
     st.stop()
+
+def auth_headers():
+    return {"Authorization": f"Bearer {api_key}"}
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 if not uploaded:
@@ -59,10 +62,10 @@ st.subheader("Mapping")
 
 id_col = st.selectbox("Colonna ID (obbligatoria)", cols, index=0)
 
-# ✅ “Titolo prodotto” (obbligatorio) -> lo passiamo come custom column
+# “Titolo prodotto” obbligatorio -> pass-through come custom column (solo numeri)
 title_col = st.selectbox("Titolo prodotto (obbligatorio)", cols, index=0)
 
-use_fixed_cost = st.checkbox('Usa COST fisso = 1 (aggiunge colonna al CSV)', value=False)
+use_fixed_cost = st.checkbox("Usa COST fisso = 1 (aggiunge colonna al CSV)", value=False)
 if not use_fixed_cost:
     cost_col = st.selectbox("Colonna COST (obbligatoria)", cols, index=1 if len(cols) > 1 else 0)
 else:
@@ -75,33 +78,28 @@ with st.expander("Opzionali"):
 
 st.subheader("Options")
 
-# ✅ options.name = nome scan (obbligatorio da docs)
+# options.name = nome scan (obbligatorio)
 default_scan_name = f"Scan - {uploaded.name}"
 scan_name = st.text_input("Nome scan (options.name) — obbligatorio", value=default_scan_name)
-
 marketplace_id = st.text_input("Marketplace ID", value="US")
 
 if not scan_name.strip():
     st.warning("Il nome scan (options.name) è obbligatorio.")
     st.stop()
 
-def safe_parse_response(resp_text: str):
-    """Tenta JSON, altrimenti ritorna stringa."""
-    try:
-        return json.loads(resp_text)
-    except Exception:
-        return resp_text.strip()
+def safe_parse_response(resp: requests.Response):
+    # alcuni endpoint potrebbero non tornare JSON
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" in ct:
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text.strip()
+    return resp.text.strip()
 
 def extract_scan_id(resp_obj):
-    """
-    Gestisce:
-    - dict JSON: {id/scan_id/...}
-    - stringa: potrebbe essere scan_id diretto
-    """
     if isinstance(resp_obj, str):
-        # se è una stringa, la trattiamo come scan_id
         return resp_obj.strip() if resp_obj.strip() else None
-
     if isinstance(resp_obj, dict):
         for k in ("scan_id", "scanId", "id"):
             v = resp_obj.get(k)
@@ -117,17 +115,16 @@ def extract_scan_id(resp_obj):
 
 def create_scan():
     url = f"{BASE_URL}/api/v3/scans"
-    headers = {"Authorization": f"Bearer {api_key}"}
 
-    # working file: originale o riscritto con __fixed_cost
     upload_bytes = file_bytes
     upload_filename = uploaded.name
 
+    # Se COST fisso => riscrivi CSV completo con colonna __fixed_cost
     if use_fixed_cost:
-        # qui sì: leggiamo tutto il CSV SOLO quando serve
         df_full = pd.read_csv(io.BytesIO(file_bytes), sep=sep)
         df_full["__fixed_cost"] = 1
         upload_bytes = df_full.to_csv(index=False).encode("utf-8")
+
         if upload_filename.lower().endswith(".csv"):
             upload_filename = upload_filename[:-4] + "_fixed_cost.csv"
         else:
@@ -135,16 +132,15 @@ def create_scan():
 
         working_cols = list(df_full.columns)
     else:
-        working_cols = cols  # bastano i nomi colonna della preview
+        working_cols = cols
 
     mapping = {
         "id": working_cols.index(id_col),
         "cost": working_cols.index("__fixed_cost") if use_fixed_cost else working_cols.index(cost_col),
-        # ✅ sempre presente (da schema): custom_columns
+        # custom columns (pass-through) – SOLO numeri
         "custom_columns": [working_cols.index(title_col)],
     }
 
-    # opzionali
     if stock_qty_col != "(none)":
         mapping["stock_quantity"] = working_cols.index(stock_qty_col)
 
@@ -153,9 +149,7 @@ def create_scan():
 
     options = {
         "marketplace_id": marketplace_id,
-        "name": scan_name,  # nome scan
-        # ✅ etichetta per custom columns, stesso ordine di mapping.custom_columns
-        
+        "name": scan_name,
     }
 
     attributes = {"mapping": mapping, "options": options}
@@ -163,25 +157,52 @@ def create_scan():
     files = {"file": (upload_filename, upload_bytes)}
     data = {"attributes": json.dumps(attributes)}
 
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+    r = requests.post(url, headers=auth_headers(), files=files, data=data, timeout=120)
 
-    # invece di r.json(), gestiamo anche risposte non-JSON
     if r.status_code >= 400:
         raise requests.HTTPError(r.text, response=r)
 
-    content_type = (r.headers.get("Content-Type") or "").lower()
-    if "application/json" in content_type:
-        try:
-            return r.json()
-        except Exception:
-            return safe_parse_response(r.text)
-    else:
-        return safe_parse_response(r.text)
+    return safe_parse_response(r)
+
+def check_results(scan_id: str):
+    # POST /api/v3/scans/{scan_id} (usiamo per capire se ci sono risultati)
+    url = f"{BASE_URL}/api/v3/scans/{scan_id}"
+    payload = {"page": 0, "per_page": 1, "tableType": "products"}
+    r = requests.post(
+        url,
+        headers={**auth_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=60
+    )
+    if r.status_code >= 400:
+        raise requests.HTTPError(r.text, response=r)
+    return safe_parse_response(r)
+
+def download_export(scan_id: str, export_type: str) -> bytes:
+    # POST /api/v3/scans/{scan_id}/download?type=csv|xlsx
+    url = f"{BASE_URL}/api/v3/scans/{scan_id}/download"
+    r = requests.post(url, headers=auth_headers(), params={"type": export_type}, timeout=300)
+    if r.status_code >= 400:
+        # ritorniamo errore leggibile (non blocchiamo)
+        raise requests.HTTPError(r.text, response=r)
+    return r.content
+
+# ---- UI state ----
+if "scan_id" not in st.session_state:
+    st.session_state["scan_id"] = None
+if "scan_ready" not in st.session_state:
+    st.session_state["scan_ready"] = False
+if "last_resp" not in st.session_state:
+    st.session_state["last_resp"] = None
 
 if st.button("🚀 Upload & Create Scan", type="primary"):
     try:
         resp = create_scan()
         scan_id = extract_scan_id(resp)
+
+        st.session_state["scan_id"] = scan_id
+        st.session_state["scan_ready"] = False
+        st.session_state["last_resp"] = resp
 
         st.success("Upload OK ✅")
         st.write("Scan ID:", scan_id if scan_id else "(non trovato)")
@@ -189,10 +210,6 @@ if st.button("🚀 Upload & Create Scan", type="primary"):
         with st.expander("Debug (risposta API)"):
             st.write("Tipo risposta:", type(resp).__name__)
             st.json(resp) if isinstance(resp, dict) else st.write(resp)
-
-        st.markdown("### Scarica output")
-        st.write("Apri RocketSource e scarica da lì.")
-        st.link_button("Apri RocketSource", "https://app.rocketsource.io")
 
     except requests.HTTPError as e:
         st.error("Errore HTTP durante upload.")
@@ -202,3 +219,70 @@ if st.button("🚀 Upload & Create Scan", type="primary"):
             st.code(str(e))
     except Exception as e:
         st.error(f"Errore: {e}")
+
+scan_id = st.session_state.get("scan_id")
+
+if scan_id:
+    st.divider()
+    st.subheader("Stato scan & Download")
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        if st.button("🔎 Check status"):
+            try:
+                res = check_results(scan_id)
+                # euristica semplice: se la risposta contiene una lista non vuota, consideriamo pronta
+                ready = False
+                if isinstance(res, dict):
+                    for k in ("products", "rows", "items", "data"):
+                        if isinstance(res.get(k), list) and len(res[k]) > 0:
+                            ready = True
+                            break
+                st.session_state["scan_ready"] = ready
+                st.success("✅ Pronta" if ready else "⏳ Ancora in elaborazione (riprovare tra poco)")
+                with st.expander("Debug (results)"):
+                    st.json(res) if isinstance(res, dict) else st.write(res)
+            except requests.HTTPError as e:
+                st.error("Errore status.")
+                st.code(getattr(e.response, "text", str(e)))
+            except Exception as e:
+                st.error(f"Errore: {e}")
+
+    ready = st.session_state.get("scan_ready", False)
+    st.caption("Se il download fallisce, premi prima **Check status** e riprova.")
+
+    # Download buttons (semplici)
+    d1, d2 = st.columns(2)
+
+    with d1:
+        if st.button("⬇️ Download CSV"):
+            try:
+                b = download_export(scan_id, "csv")
+                st.download_button(
+                    "Salva CSV",
+                    data=b,
+                    file_name=f"{scan_id}.csv",
+                    mime="text/csv"
+                )
+            except requests.HTTPError as e:
+                st.error("Download CSV fallito (probabilmente scan non pronta).")
+                st.code(getattr(e.response, "text", str(e)))
+            except Exception as e:
+                st.error(f"Errore: {e}")
+
+    with d2:
+        if st.button("⬇️ Download XLSX"):
+            try:
+                b = download_export(scan_id, "xlsx")
+                st.download_button(
+                    "Salva XLSX",
+                    data=b,
+                    file_name=f"{scan_id}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except requests.HTTPError as e:
+                st.error("Download XLSX fallito (probabilmente scan non pronta).")
+                st.code(getattr(e.response, "text", str(e)))
+            except Exception as e:
+                st.error(f"Errore: {e}")
