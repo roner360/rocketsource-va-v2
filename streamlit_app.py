@@ -20,6 +20,13 @@ if not api_key:
 def auth_headers():
     return {"Authorization": f"Bearer {api_key}"}
 
+def safe_json(resp: requests.Response):
+    # prova JSON, altrimenti text
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
+
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 if not uploaded:
     st.stop()
@@ -45,7 +52,7 @@ else:
 
 st.caption(f"Delimiter usato: `{repr(sep)}`")
 
-# Preview safe (solo 10 righe)
+# Preview (solo 10 righe)
 try:
     df_preview = pd.read_csv(io.BytesIO(file_bytes), sep=sep, nrows=10)
 except Exception as e:
@@ -74,60 +81,14 @@ st.subheader("Options")
 scan_name = st.text_input("Nome scan (options.name) — obbligatorio", value=f"Scan - {uploaded.name}")
 marketplace_id = st.text_input("Marketplace ID", value="US")
 
+debug_mode = st.checkbox("Debug mode (mostra JSON scans)", value=False)
+
 if not scan_name.strip():
     st.warning("Il nome scan (options.name) è obbligatorio.")
     st.stop()
 
-def safe_body(resp: requests.Response):
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    if "application/json" in ct:
-        try:
-            return resp.json()
-        except Exception:
-            return resp.text.strip()
-    return resp.text.strip()
-
-def extract_scan_id_from_anything(body_obj, headers_dict):
-    # 1) body JSON dict
-    if isinstance(body_obj, dict):
-        for k in ("scan_id", "scanId", "id"):
-            if body_obj.get(k):
-                return str(body_obj.get(k))
-        if isinstance(body_obj.get("scan"), dict):
-            inner = body_obj["scan"]
-            for k in ("scan_id", "scanId", "id"):
-                if inner.get(k):
-                    return str(inner.get(k))
-
-    # 2) header Location: spesso contiene /scans/{id}
-    loc = headers_dict.get("Location") or headers_dict.get("location")
-    if loc:
-        m = re.search(r"/scans/(\d+)", loc)
-        if m:
-            return m.group(1)
-        # fallback: primo gruppo numerico lungo
-        m2 = re.search(r"(\d+)", loc)
-        if m2:
-            return m2.group(1)
-
-    # 3) qualsiasi header che contenga un id numerico
-    for hk, hv in headers_dict.items():
-        if not isinstance(hv, str):
-            continue
-        if "scan" in hk.lower() or "id" in hk.lower() or "location" in hk.lower():
-            m = re.search(r"(\d+)", hv)
-            if m:
-                return m.group(1)
-
-    # 4) body string: se è solo numero
-    if isinstance(body_obj, str):
-        s = body_obj.strip()
-        if re.fullmatch(r"\d+", s):
-            return s
-
-    return None
-
-def create_scan():
+# ---------- API calls ----------
+def upload_scan():
     url = f"{BASE_URL}/api/v3/scans"
 
     upload_bytes = file_bytes
@@ -145,7 +106,6 @@ def create_scan():
     mapping = {
         "id": working_cols.index(id_col),
         "cost": working_cols.index("__fixed_cost") if use_fixed_cost else working_cols.index(cost_col),
-        # custom_columns deve essere presente e numerico
         "custom_columns": [working_cols.index(title_col)],
     }
 
@@ -166,16 +126,78 @@ def create_scan():
     data = {"attributes": json.dumps(attributes)}
 
     r = requests.post(url, headers=auth_headers(), files=files, data=data, timeout=120)
-
-    body = safe_body(r)
-    hdrs = dict(r.headers)
-
     if r.status_code >= 400:
         raise requests.HTTPError(r.text, response=r)
 
-    scan_id = extract_scan_id_from_anything(body, hdrs)
+    return r.text  # nel tuo caso: "ok"
 
-    return scan_id, body, hdrs
+def list_completed_scans(page: int = 1):
+    # docs: GET /api/v3/scans (completed scans)
+    url = f"{BASE_URL}/api/v3/scans"
+    r = requests.get(url, headers=auth_headers(), params={"page": page}, timeout=60)
+    if r.status_code >= 400:
+        raise requests.HTTPError(r.text, response=r)
+    return safe_json(r)
+
+def find_latest_scan_id(scans_json, target_name: str):
+    """
+    Trova lo scan più recente che matcha options.name == target_name.
+    Funziona anche se la risposta è lista o dict.
+    """
+    # Normalizza: lista di scans
+    if isinstance(scans_json, list):
+        scans = scans_json
+    elif isinstance(scans_json, dict):
+        # comune: { "scans": [...] } oppure { "data": [...] }
+        if isinstance(scans_json.get("scans"), list):
+            scans = scans_json["scans"]
+        elif isinstance(scans_json.get("data"), list):
+            scans = scans_json["data"]
+        else:
+            # fallback: prova a prendere il primo array trovato
+            scans = None
+            for v in scans_json.values():
+                if isinstance(v, list):
+                    scans = v
+                    break
+            scans = scans or []
+    else:
+        scans = []
+
+    # Filtra per name
+    matches = []
+    for s in scans:
+        if not isinstance(s, dict):
+            continue
+        # prova più strutture: s["options"]["name"] oppure s["name"]
+        name = None
+        if isinstance(s.get("options"), dict):
+            name = s["options"].get("name")
+        if name is None:
+            name = s.get("name")
+        if name == target_name:
+            matches.append(s)
+
+    # Ordina: preferisci created_at, altrimenti id numerico
+    def sort_key(s):
+        created = s.get("created_at") or s.get("createdAt") or ""
+        sid = s.get("id") or s.get("scan_id") or s.get("scanId") or 0
+        try:
+            sid_num = int(sid)
+        except Exception:
+            sid_num = 0
+        return (created, sid_num)
+
+    matches.sort(key=sort_key, reverse=True)
+
+    if matches:
+        s = matches[0]
+        sid = s.get("id") or s.get("scan_id") or s.get("scanId")
+        if sid is not None:
+            return str(sid)
+
+    # se non trovi match per name, niente
+    return None
 
 def download_export(scan_id: str, export_type: str) -> bytes:
     url = f"{BASE_URL}/api/v3/scans/{scan_id}/download"
@@ -184,30 +206,23 @@ def download_export(scan_id: str, export_type: str) -> bytes:
         raise requests.HTTPError(r.text, response=r)
     return r.content
 
-# ---- UI state ----
+# ---------- UI state ----------
 if "scan_id" not in st.session_state:
     st.session_state["scan_id"] = None
-if "upload_debug" not in st.session_state:
-    st.session_state["upload_debug"] = None
+if "last_upload_resp" not in st.session_state:
+    st.session_state["last_upload_resp"] = None
+if "last_scans_json" not in st.session_state:
+    st.session_state["last_scans_json"] = None
 
+# ---------- Actions ----------
 if st.button("🚀 Upload & Create Scan", type="primary"):
     try:
-        scan_id, body, hdrs = create_scan()
-        st.session_state["scan_id"] = scan_id
-        st.session_state["upload_debug"] = {"body": body, "headers": hdrs}
+        resp_text = upload_scan()
+        st.session_state["last_upload_resp"] = resp_text
+        st.session_state["scan_id"] = None  # reset finché non lo troviamo
 
-        if not scan_id:
-            st.error("Upload OK ma non riesco a trovare lo scan_id nella risposta/headers.")
-            st.info("Apri Debug e dimmi cosa c'è in 'headers' (specie Location).")
-        else:
-            st.success(f"Upload OK ✅  • Scan ID: {scan_id}")
-
-        with st.expander("Debug upload (body + headers)"):
-            dbg = st.session_state["upload_debug"]
-            st.write("Body type:", type(dbg["body"]).__name__)
-            st.json(dbg["body"]) if isinstance(dbg["body"], dict) else st.write(dbg["body"])
-            st.write("Headers:")
-            st.json(dbg["headers"])
+        st.success(f"Upload OK ✅ (server reply: {resp_text})")
+        st.info("Ora premi **Find my scan (latest completed)** per recuperare lo scan_id (compare solo quando è COMPLETATO).")
 
     except requests.HTTPError as e:
         st.error("Errore HTTP durante upload.")
@@ -215,33 +230,54 @@ if st.button("🚀 Upload & Create Scan", type="primary"):
     except Exception as e:
         st.error(f"Errore: {e}")
 
-scan_id = st.session_state.get("scan_id")
+if st.button("🔎 Find my scan (latest completed)"):
+    try:
+        scans_json = list_completed_scans(page=1)
+        st.session_state["last_scans_json"] = scans_json
 
+        scan_id = find_latest_scan_id(scans_json, scan_name)
+        if scan_id:
+            st.session_state["scan_id"] = scan_id
+            st.success(f"Trovato scan completato ✅  • Scan ID: {scan_id}")
+        else:
+            st.warning("Non trovato ancora. Probabile che la scan NON sia completata. Riprova tra poco.")
+
+        if debug_mode:
+            with st.expander("Debug GET /api/v3/scans JSON"):
+                st.json(scans_json) if isinstance(scans_json, (dict, list)) else st.write(scans_json)
+
+    except requests.HTTPError as e:
+        st.error("Errore HTTP su GET /api/v3/scans.")
+        st.code(getattr(e.response, "text", str(e)))
+    except Exception as e:
+        st.error(f"Errore: {e}")
+
+scan_id = st.session_state.get("scan_id")
 if scan_id:
     st.divider()
-    st.subheader("Download (VA)")
+    st.subheader("Download (da Streamlit)")
 
     c1, c2 = st.columns(2)
 
     with c1:
-        if st.button("⬇️ Genera CSV"):
+        if st.button("⬇️ Download CSV"):
             try:
                 b = download_export(scan_id, "csv")
                 st.download_button("Salva CSV", data=b, file_name=f"{scan_id}.csv", mime="text/csv")
             except requests.HTTPError as e:
-                st.error("Download CSV fallito (scan non pronta o errore API).")
+                st.error("Download CSV fallito.")
                 st.code(getattr(e.response, "text", str(e)))
 
     with c2:
-        if st.button("⬇️ Genera XLSX"):
+        if st.button("⬇️ Download XLSX"):
             try:
                 b = download_export(scan_id, "xlsx")
                 st.download_button(
                     "Salva XLSX",
                     data=b,
                     file_name=f"{scan_id}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             except requests.HTTPError as e:
-                st.error("Download XLSX fallito (scan non pronta o errore API).")
+                st.error("Download XLSX fallito.")
                 st.code(getattr(e.response, "text", str(e)))
